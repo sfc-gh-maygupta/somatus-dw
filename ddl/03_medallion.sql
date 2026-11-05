@@ -1,0 +1,54 @@
+-- ============================================================
+-- SOMATUS DEMO · 03 MEDALLION + INCREMENTAL PROCESSING
+-- Kenny: "processing only new or updated records rather than repeatedly
+--         loading entire datasets"
+-- Bronze (raw, as landed) -> Silver (typed, cleansed, deduped) -> Gold (business-ready)
+-- ============================================================
+USE ROLE ACCOUNTADMIN;
+USE WAREHOUSE WH_TRANSFORM;
+
+-- ---------- Schema change, downstream view ----------
+-- After the AETNA v2 file added DIALYSIS_MODALITY to Bronze, Silver kept running untouched.
+-- Surfacing it is a deliberate one-line change (no reload, no pipeline rewrite):
+CREATE OR REPLACE DYNAMIC TABLE SOMATUS_DEMO.SILVER.MEMBERS_CLEAN
+  TARGET_LAG='1 minute' WAREHOUSE=WH_TRANSFORM REFRESH_MODE=INCREMENTAL AS
+SELECT MEMBER_ID, CLIENT_ID, DOB, GENDER, CKD_STAGE, STATE, DIALYSIS_MODALITY, FILE_NAME, LOADED_AT
+FROM SOMATUS_DEMO.BRONZE.MEMBERS_RAW
+WHERE MEMBER_ID IS NOT NULL AND DOB IS NOT NULL AND LENGTH(STATE) = 2
+QUALIFY ROW_NUMBER() OVER (PARTITION BY MEMBER_ID ORDER BY LOADED_AT DESC) = 1;
+CREATE OR REPLACE DYNAMIC TABLE SOMATUS_DEMO.GOLD.CLIENT_CKD_SUMMARY
+  TARGET_LAG='1 minute' WAREHOUSE=WH_TRANSFORM REFRESH_MODE=INCREMENTAL AS
+SELECT CLIENT_ID, CKD_STAGE, COUNT(*) AS MEMBERS, COUNT_IF(DIALYSIS_MODALITY IS NOT NULL) AS ON_DIALYSIS
+FROM SOMATUS_DEMO.SILVER.MEMBERS_CLEAN GROUP BY 1, 2;
+SELECT * FROM SOMATUS_DEMO.GOLD.CLIENT_CKD_SUMMARY ORDER BY 1, 2;
+
+-- ---------- Option 1: Dynamic Tables (declarative) ----------
+-- Silver: SOMATUS_DEMO.SILVER.MEMBERS_CLEAN  (dedupe latest per member, drop invalid)
+--         SOMATUS_DEMO.SILVER.LAB_RESULTS    (FLATTEN nested JSON panel -> 1 row per test)
+--         SOMATUS_DEMO.SILVER.CLIENT_CLAIMS  (typed Avro claims)
+-- Gold:   SOMATUS_DEMO.GOLD.CLIENT_CKD_SUMMARY, SOMATUS_DEMO.GOLD.MEMBER_EGFR_TREND
+SHOW DYNAMIC TABLES IN DATABASE SOMATUS_DEMO;
+-- Snowsight: open GOLD.CLIENT_CKD_SUMMARY > Graph tab to show the dependency chain
+
+-- What the SQL looks like (no orchestration code, just a SELECT + freshness target):
+SELECT GET_DDL('DYNAMIC_TABLE', 'SOMATUS_DEMO.SILVER.MEMBERS_CLEAN');
+
+-- LIVE: add 1,000 new member rows (or drop a new file via Snowpipe)
+INSERT INTO SOMATUS_DEMO.BRONZE.MEMBERS_RAW
+  (MEMBER_ID, CLIENT_ID, DOB, GENDER, CKD_STAGE, STATE, DIALYSIS_MODALITY, FILE_NAME, LOADED_AT)
+SELECT 'M8' || LPAD(SEQ4()::STRING, 7, '0'), 'HUMANA_DEMO', '1960-01-01', 'F', 'CKD5', 'VA', 'HOME_HD',
+       'live_demo_insert', CURRENT_TIMESTAMP()
+FROM TABLE(GENERATOR(ROWCOUNT => 1000));
+
+-- Wait for target lag, or refresh now:
+ALTER DYNAMIC TABLE SOMATUS_DEMO.SILVER.MEMBERS_CLEAN REFRESH;
+ALTER DYNAMIC TABLE SOMATUS_DEMO.GOLD.CLIENT_CKD_SUMMARY REFRESH;
+
+-- PROOF: INCREMENTAL, ~1,000 rows processed (not 5M). NO_DATA = nothing changed, nothing billed.
+SELECT NAME, REFRESH_ACTION, STATE,
+       STATISTICS:numInsertedRows::INT AS INSERTED, STATISTICS:numDeletedRows::INT AS DELETED,
+       DATEDIFF('millisecond', REFRESH_START_TIME, REFRESH_END_TIME) AS MS
+FROM TABLE(SOMATUS_DEMO.INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY())
+WHERE NAME IN ('MEMBERS_CLEAN','CLIENT_CKD_SUMMARY')
+ORDER BY REFRESH_START_TIME DESC LIMIT 6;
+

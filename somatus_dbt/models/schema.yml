@@ -1,0 +1,11 @@
+version: 2
+models:
+  - name: fct_claims
+    description: "Clean claims, built incrementally from Bronze."
+    columns:
+      - name: claim_id
+        tests: [not_null, unique]
+      - name: member_id
+        tests: [not_null]
+      - name: paid_amount
+        tests: [not_null]

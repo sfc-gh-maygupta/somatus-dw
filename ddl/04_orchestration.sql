@@ -1,0 +1,52 @@
+-- ============================================================
+-- SOMATUS DEMO · 04 ORCHESTRATION, FAILURE, RETRY, ALERT, RECOVERY
+-- Kenny: "managing dependent workflows, failures, retries, and
+--         notifications for failed jobs or missed SLAs"
+-- Graph: T_ROOT -> T_VALIDATE -> T_TRANSFORM (refresh GOLD.CLAIMS_PUBLISHED) -> T_PUBLISH ; finalizer T_NOTIFY
+-- ============================================================
+USE ROLE ACCOUNTADMIN;
+USE SCHEMA SOMATUS_DEMO.OPS;
+
+-- Snowsight: Data > SOMATUS_DEMO > OPS > Tasks > T_ROOT > Graph  (show the DAG visually)
+SHOW TASKS LIKE 'T_%' IN SCHEMA SOMATUS_DEMO.OPS;
+-- Key settings: TASK_AUTO_RETRY_ATTEMPTS=1 on root, FINALIZE=T_ROOT on T_NOTIFY
+
+-- ---------- STEP 1 · New batch arrives ----------
+INSERT INTO SOMATUS_DEMO.BRONZE.CLAIMS_RAW
+  (CLAIM_ID, MEMBER_ID, CLIENT_ID, SERVICE_DATE, CPT_CODE, PAID_AMOUNT, CLAIM_STATUS, FILE_NAME, LOADED_AT)
+SELECT 'LIVE_' || UUID_STRING(), 'M00000001', 'HUMANA_DEMO', '2026-10-21', '90935', 450, 'PAID',
+       'live_batch', CURRENT_TIMESTAMP()
+FROM TABLE(GENERATOR(ROWCOUNT => 500));
+SELECT (SELECT COUNT(*) FROM SOMATUS_DEMO.BRONZE.CLAIMS_RAW WHERE FILE_NAME='live_batch') AS ARRIVED_IN_BRONZE,
+       (SELECT COUNT(*) FROM SOMATUS_DEMO.GOLD.CLAIMS_PUBLISHED WHERE FILE_NAME='live_batch') AS PUBLISHED_TO_GOLD;   -- 500 and 0
+
+-- ---------- STEP 2 · Break it ----------
+UPDATE DEMO_CONTROL SET VAL = 'TRUE' WHERE KEY = 'FAIL_VALIDATE';
+TRUNCATE TABLE PIPELINE_LOG;
+EXECUTE TASK T_ROOT;
+
+-- ~30s later: T_VALIDATE FAILED, auto-retried (attempt 2), finalizer emailed you
+SELECT NAME, STATE, ATTEMPT_NUMBER, LEFT(ERROR_MESSAGE, 100) AS ERROR, SCHEDULED_TIME
+FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY(SCHEDULED_TIME_RANGE_START => DATEADD('minute', -10, CURRENT_TIMESTAMP())))
+WHERE NAME IN ('T_ROOT','T_VALIDATE','T_TRANSFORM','T_PUBLISH','T_NOTIFY')
+ORDER BY SCHEDULED_TIME, NAME;
+SELECT * FROM PIPELINE_LOG ORDER BY LOGGED_AT;
+-- Show the email in your inbox. Nothing downstream ran: Gold was not touched with bad data.
+
+-- ---------- STEP 3 · Fix and recover from the failed step ----------
+UPDATE DEMO_CONTROL SET VAL = 'FALSE' WHERE KEY = 'FAIL_VALIDATE';
+EXECUTE TASK T_ROOT RETRY LAST;     -- resumes at T_VALIDATE; T_ROOT is not re-run
+-- re-run the TASK_HISTORY query: attempt 3 succeeds through T_PUBLISH
+SELECT * FROM PIPELINE_LOG ORDER BY LOGGED_AT;
+SELECT (SELECT COUNT(*) FROM SOMATUS_DEMO.BRONZE.CLAIMS_RAW WHERE FILE_NAME='live_batch') AS ARRIVED_IN_BRONZE,
+       (SELECT COUNT(*) FROM SOMATUS_DEMO.GOLD.CLAIMS_PUBLISHED WHERE FILE_NAME='live_batch') AS PUBLISHED_TO_GOLD;   -- 500 and 500: published once
+
+-- ---------- STEP 4 · SLA alert ----------
+-- Fires if Gold hasn't published within the window (5 min for demo purposes)
+EXECUTE ALERT ALERT_GOLD_SLA;
+SELECT NAME, STATE, SCHEDULED_TIME, SQL_ERROR_MESSAGE
+FROM TABLE(INFORMATION_SCHEMA.ALERT_HISTORY(SCHEDULED_TIME_RANGE_START => DATEADD('hour', -1, CURRENT_TIMESTAMP())))
+ORDER BY SCHEDULED_TIME DESC;
+
+-- Production: schedule the root (CRON):
+-- ALTER TASK T_ROOT SET SCHEDULE = 'USING CRON 0 5 * * * America/New_York';

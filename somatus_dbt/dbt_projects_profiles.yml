@@ -1,0 +1,12 @@
+somatus_dbt:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: 'not needed'
+      user: 'not needed'
+      role: ACCOUNTADMIN
+      warehouse: WH_TRANSFORM
+      database: SOMATUS_DEMO
+      schema: GOLD
+      threads: 8
